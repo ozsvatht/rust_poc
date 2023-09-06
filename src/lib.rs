@@ -2,6 +2,10 @@ use ctor::ctor;
 use once_cell::sync::Lazy;
 use std::time::Duration;
 use testcontainers::{clients, core::Port, Container, Docker, Image};
+use sqlx::postgres::PgPool;
+use sqlx::postgres::*;
+use sqlx::query;
+use sqlx::{Connection, PgConnection};
 
 static ENV: Lazy<TestEnvironment> = Lazy::new(|| TestEnvironment::new());
 
@@ -78,15 +82,65 @@ impl<'a> TestEnvironment<'a> {
     }
 }
 
+async fn establish_connection(port: u16) -> PgPool {
+    let database_url = format!(
+        "postgres://{}:{}@localhost:{}/{}",
+        "postgres", "postgres", port, "postgres"
+    );
+
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("Failed to create pool.");
+    
+    pool
+}
+
 #[tokio::test]
-async fn test_run_postgres_container() {
+async fn test_sqlx_operations() {
     let docker = clients::Cli::default();
     let postgres = Postgres::default();
 
-    // Run the postgres container
-    // Once _container goes out of scope and is dropped, the container is stopped and removed.
-    //make _container a global variable to be available for all tests
     let _container = docker.run(postgres);
 
-    std::thread::sleep(Duration::from_secs(120));
+    is_postgres_ready(5432, 30).await.expect("Failed to connect to Postgres after waiting");
+    let pool = establish_connection(5432).await; // Assuming you're using the default PostgreSQL port
+
+    sqlx::query(r#"
+        CREATE TABLE IF NOT EXISTS your_table_name(
+            id SERIAL PRIMARY KEY,
+            your_column TEXT NOT NULL
+        )
+    "#)
+    .execute(&pool)
+    .await
+    .expect("Failed to create table");
+
+    // Insert operation
+    sqlx::query("INSERT INTO your_table_name(your_column) VALUES ($1)")
+        .bind("SomeValue")
+        .execute(&pool)
+        .await
+        .expect("Failed to insert");
+
+    // Select operation
+    let result: (String,) = sqlx::query_as("SELECT your_column FROM your_table_name WHERE your_column = $1")
+        .bind("SomeValue")
+        .fetch_one(&pool)
+        .await
+        .expect("Failed to fetch");
+
+    println!("result: {}", result.0);
+
+    assert_eq!(result.0, "SomeValue");
+}
+
+async fn is_postgres_ready(port: u16, max_retries: u32) -> Result<(), Box<dyn std::error::Error>> {
+    let connection_string = format!("postgres://postgres:postgres@localhost:{}/postgres", port);
+    for _ in 0..max_retries {
+        if sqlx::PgConnection::connect(&connection_string).await.is_ok() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    Err("Max retries reached while waiting for Postgres connection".into())
 }
